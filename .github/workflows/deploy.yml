@@ -35,6 +35,7 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_STACK_NAME: ${{ vars.AWS_STACK_NAME }}
+      SAM_CLI_TELEMETRY: "0"
 
     steps:
       - name: Check out repository
@@ -118,15 +119,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           aws --version
           sam --version
           docker --version
 
       - name: Validate SAM template
-        run: sam validate --lint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sam validate \
+            --template-file template.yaml \
+            --lint
 
       - name: Build Lambda container
-        run: sam build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sam build \
+            --template-file template.yaml
 
       - name: Deploy SAM application
         shell: bash
@@ -134,8 +147,10 @@ jobs:
           set -euo pipefail
 
           sam deploy \
+            --template-file .aws-sam/build/template.yaml \
             --stack-name "$AWS_STACK_NAME" \
             --region "$AWS_REGION" \
+            --resolve-s3 \
             --resolve-image-repos \
             --capabilities CAPABILITY_IAM \
             --no-confirm-changeset \
