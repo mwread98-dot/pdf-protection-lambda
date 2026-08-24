@@ -12,11 +12,17 @@ RUN apt-get update \
 WORKDIR /var/task
 
 COPY requirements.txt .
+
 RUN pip install \
     --no-cache-dir \
     --requirement requirements.txt
 
 COPY app.py .
 
+RUN python -m py_compile /var/task/app.py
+
+RUN qpdf --version
+
 ENTRYPOINT ["/usr/local/bin/python", "-m", "awslambdaric"]
+
 CMD ["app.lambda_handler"]
