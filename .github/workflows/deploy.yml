@@ -24,7 +24,11 @@ concurrency:
 jobs:
   validate-build-deploy:
     name: Validate, build and deploy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
+    permissions:
+      id-token: write
+      contents: read
 
     environment: production
 
@@ -35,51 +39,38 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
-      - name: Show GitHub OIDC claims
+
+      - name: Check deployment configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          RESPONSE="$(
-            curl --silent --show-error --fail \
-              --header "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com"
-          )"
+          EXPECTED_ROLE="arn:aws:iam::975050060060:role/GitHubActions-PdfProtection-Deploy"
 
-          JWT="$(
-            printf '%s' "$RESPONSE" |
-            python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])'
-          )"
+          if [ -z "${{ vars.AWS_ROLE_ARN }}" ]; then
+            echo "AWS_ROLE_ARN repository variable is not defined."
+            exit 1
+          fi
 
-          export JWT
+          if [ "${{ vars.AWS_ROLE_ARN }}" != "$EXPECTED_ROLE" ]; then
+            echo "AWS_ROLE_ARN contains an unexpected value."
+            echo "Expected: $EXPECTED_ROLE"
+            exit 1
+          fi
 
-          python3 - <<'PY'
-          import base64
-          import json
-          import os
+          if [ -z "${AWS_REGION}" ]; then
+            echo "AWS_REGION repository variable is not defined."
+            exit 1
+          fi
 
-          token = os.environ["JWT"]
-          payload = token.split(".")[1]
-          payload += "=" * (-len(payload) % 4)
+          if [ -z "${AWS_STACK_NAME}" ]; then
+            echo "AWS_STACK_NAME repository variable is not defined."
+            exit 1
+          fi
 
-          claims = json.loads(
-              base64.urlsafe_b64decode(payload).decode("utf-8")
-          )
-
-          safe_claims = {
-              "iss": claims.get("iss"),
-              "aud": claims.get("aud"),
-              "sub": claims.get("sub"),
-              "repository": claims.get("repository"),
-              "repository_id": claims.get("repository_id"),
-              "repository_owner": claims.get("repository_owner"),
-              "repository_owner_id": claims.get("repository_owner_id"),
-              "environment": claims.get("environment"),
-              "ref": claims.get("ref"),
-          }
-
-          print(json.dumps(safe_claims, indent=2))
-          PY
+          echo "AWS role: $EXPECTED_ROLE"
+          echo "AWS Region: $AWS_REGION"
+          echo "CloudFormation stack: $AWS_STACK_NAME"
 
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v6
@@ -88,15 +79,34 @@ jobs:
           role-session-name: github-pdf-protection-deploy
           aws-region: ${{ vars.AWS_REGION }}
           audience: sts.amazonaws.com
-      - name: Configure AWS credentials using OIDC
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: github-pdf-protection-deploy
-          aws-region: ${{ vars.AWS_REGION }}
+          retry-max-attempts: 3
 
-      - name: Display AWS identity
-        run: aws sts get-caller-identity
+      - name: Verify assumed AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="$(
+            aws sts get-caller-identity \
+              --query Account \
+              --output text
+          )"
+
+          CALLER_ARN="$(
+            aws sts get-caller-identity \
+              --query Arn \
+              --output text
+          )"
+
+          if [ "$ACCOUNT_ID" != "975050060060" ]; then
+            echo "The workflow authenticated to the wrong AWS account."
+            echo "Expected account: 975050060060"
+            echo "Actual account: $ACCOUNT_ID"
+            exit 1
+          fi
+
+          echo "AWS account verified: $ACCOUNT_ID"
+          echo "Caller ARN: $CALLER_ARN"
 
       - name: Install AWS SAM CLI
         uses: aws-actions/setup-sam@v3
@@ -105,7 +115,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Display tool versions
+        shell: bash
         run: |
+          set -euo pipefail
           aws --version
           sam --version
           docker --version
@@ -117,7 +129,10 @@ jobs:
         run: sam build
 
       - name: Deploy SAM application
+        shell: bash
         run: |
+          set -euo pipefail
+
           sam deploy \
             --stack-name "$AWS_STACK_NAME" \
             --region "$AWS_REGION" \
@@ -131,7 +146,10 @@ jobs:
               EphemeralStorageSize=4096
 
       - name: Display deployment outputs
+        shell: bash
         run: |
+          set -euo pipefail
+
           aws cloudformation describe-stacks \
             --stack-name "$AWS_STACK_NAME" \
             --region "$AWS_REGION" \
