@@ -81,8 +81,7 @@ jobs:
           if grep -n "ReservedConcurrentExecutions" template.yaml; then
             echo
             echo "ERROR: template.yaml contains ReservedConcurrentExecutions."
-            echo "This AWS account cannot support the requested reservation."
-            echo "Remove the ReservedConcurrentExecutions property."
+            echo "Remove that property before deploying."
             exit 1
           fi
 
@@ -102,6 +101,163 @@ jobs:
         run: |
           set -euo pipefail
 
-          ACCOUNT_ID="$(
-            aws sts get-caller-identity \
-        
+          IDENTITY_JSON="$(aws sts get-caller-identity --output json)"
+          ACCOUNT_ID="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Account"])')"
+          CALLER_ARN="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Arn"])')"
+
+          if [ "$ACCOUNT_ID" != "975050060060" ]; then
+            echo "The workflow authenticated to the wrong AWS account."
+            echo "Expected account: 975050060060"
+            echo "Actual account: $ACCOUNT_ID"
+            exit 1
+          fi
+
+          echo "AWS account verified: $ACCOUNT_ID"
+          echo "Caller ARN: $CALLER_ARN"
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Display tool versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws --version
+          sam --version
+          docker --version
+
+      - name: Validate SAM template
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sam validate \
+            --template-file template.yaml \
+            --lint
+
+      - name: Build Lambda container
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sam build \
+            --template-file template.yaml
+
+      - name: Verify built template does not reserve concurrency
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -n "ReservedConcurrentExecutions" .aws-sam/build/template.yaml; then
+            echo
+            echo "ERROR: Built template contains ReservedConcurrentExecutions."
+            exit 1
+          fi
+
+          echo "Confirmed: built template has no reserved concurrency."
+
+      - name: Ensure CloudFormation stack can be deployed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STACK_STATUS="$(
+            aws cloudformation describe-stacks \
+              --stack-name "$AWS_STACK_NAME" \
+              --region "$AWS_REGION" \
+              --query "Stacks[0].StackStatus" \
+              --output text \
+              2>/dev/null || true
+          )"
+
+          if [ -z "$STACK_STATUS" ]; then
+            echo "No existing CloudFormation stack found."
+            exit 0
+          fi
+
+          echo "Existing CloudFormation stack status: $STACK_STATUS"
+
+          case "$STACK_STATUS" in
+            CREATE_COMPLETE|UPDATE_COMPLETE)
+              echo "Existing stack can be updated."
+              ;;
+
+            ROLLBACK_COMPLETE|DELETE_IN_PROGRESS|DELETE_FAILED)
+              echo "ERROR: Existing stack is not deployable."
+              echo "Delete or finish deleting the stack before rerunning."
+              exit 1
+              ;;
+
+            *)
+              echo "ERROR: Stack is currently in status $STACK_STATUS."
+              echo "Wait for the current CloudFormation operation to finish."
+              exit 1
+              ;;
+          esac
+
+      - name: Ensure application bucket names are available
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INPUT_BUCKET="pdf-protection-input-975050060060-eu-west-2"
+          OUTPUT_BUCKET="pdf-protection-output-975050060060-eu-west-2"
+
+          STACK_EXISTS="$(
+            aws cloudformation describe-stacks \
+              --stack-name "$AWS_STACK_NAME" \
+              --region "$AWS_REGION" \
+              --query "Stacks[0].StackStatus" \
+              --output text \
+              2>/dev/null || true
+          )"
+
+          if [ -z "$STACK_EXISTS" ]; then
+            if aws s3api head-bucket --bucket "$INPUT_BUCKET" >/dev/null 2>&1; then
+              echo "ERROR: Input bucket already exists outside the new stack:"
+              echo "$INPUT_BUCKET"
+              exit 1
+            fi
+
+            if aws s3api head-bucket --bucket "$OUTPUT_BUCKET" >/dev/null 2>&1; then
+              echo "ERROR: Output bucket already exists outside the new stack:"
+              echo "$OUTPUT_BUCKET"
+              exit 1
+            fi
+          fi
+
+          echo "Application bucket-name check passed."
+
+      - name: Deploy SAM application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name "$AWS_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --resolve-s3 \
+            --resolve-image-repos \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              FunctionMemorySize=2048 \
+              FunctionTimeout=300 \
+              EphemeralStorageSize=4096
+
+      - name: Display deployment outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs" \
+            --output table
