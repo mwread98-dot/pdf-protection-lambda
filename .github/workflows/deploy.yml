@@ -1,242 +1,172 @@
-AWSTemplateFormatVersion: "2010-09-09"
-Transform: AWS::Serverless-2016-10-31
+name: Build and deploy PDF protection service
 
-Description: >
-  Serverless PDF protection pipeline using Amazon S3,
-  AWS Lambda, qpdf and AWS Secrets Manager.
+on:
+  workflow_dispatch:
 
-Parameters:
-  FunctionMemorySize:
-    Type: Number
-    Default: 2048
-    MinValue: 1024
-    MaxValue: 10240
-    Description: Memory allocated to the PDF processing Lambda function.
+  push:
+    branches:
+      - main
+    paths:
+      - "app.py"
+      - "Dockerfile"
+      - "requirements.txt"
+      - "template.yaml"
+      - ".github/workflows/deploy.yml"
 
-  FunctionTimeout:
-    Type: Number
-    Default: 300
-    MinValue: 30
-    MaxValue: 900
-    Description: Lambda timeout in seconds.
+permissions:
+  id-token: write
+  contents: read
 
-  EphemeralStorageSize:
-    Type: Number
-    Default: 4096
-    MinValue: 512
-    MaxValue: 10240
-    Description: Temporary Lambda storage in MB.
+concurrency:
+  group: pdf-protection-production
+  cancel-in-progress: false
 
-Resources:
-  InputBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      BucketName: !Sub "pdf-protection-input-${AWS::AccountId}-${AWS::Region}"
+jobs:
+  validate-build-deploy:
+    name: Validate, build and deploy
+    runs-on: ubuntu-24.04
 
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+    permissions:
+      id-token: write
+      contents: read
 
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
+    environment: production
 
-      VersioningConfiguration:
-        Status: Enabled
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_STACK_NAME: ${{ vars.AWS_STACK_NAME }}
+      SAM_CLI_TELEMETRY: "0"
 
-      LifecycleConfiguration:
-        Rules:
-          - Id: AbortIncompleteMultipartUploads
-            Status: Enabled
-            AbortIncompleteMultipartUpload:
-              DaysAfterInitiation: 7
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
 
-  OutputBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      BucketName: !Sub "pdf-protection-output-${AWS::AccountId}-${AWS::Region}"
+      - name: Check deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+          EXPECTED_ROLE="arn:aws:iam::975050060060:role/GitHubActions-PdfProtection-Deploy"
 
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
+          if [ -z "${{ vars.AWS_ROLE_ARN }}" ]; then
+            echo "AWS_ROLE_ARN repository variable is not defined."
+            exit 1
+          fi
 
-      VersioningConfiguration:
-        Status: Enabled
+          if [ "${{ vars.AWS_ROLE_ARN }}" != "$EXPECTED_ROLE" ]; then
+            echo "AWS_ROLE_ARN contains an unexpected value."
+            echo "Expected: $EXPECTED_ROLE"
+            exit 1
+          fi
 
-      LifecycleConfiguration:
-        Rules:
-          - Id: AbortIncompleteMultipartUploads
-            Status: Enabled
-            AbortIncompleteMultipartUpload:
-              DaysAfterInitiation: 7
+          if [ -z "${AWS_REGION}" ]; then
+            echo "AWS_REGION repository variable is not defined."
+            exit 1
+          fi
 
-  PdfOwnerPasswordSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub "${AWS::StackName}/pdf-owner-password"
-      Description: Owner password used to protect generated PDF documents
+          if [ -z "${AWS_STACK_NAME}" ]; then
+            echo "AWS_STACK_NAME repository variable is not defined."
+            exit 1
+          fi
 
-      GenerateSecretString:
-        SecretStringTemplate: '{"purpose":"pdf-owner-password"}'
-        GenerateStringKey: owner_password
-        PasswordLength: 40
-        ExcludePunctuation: true
+          echo "AWS role: $EXPECTED_ROLE"
+          echo "AWS Region: $AWS_REGION"
+          echo "CloudFormation stack: $AWS_STACK_NAME"
 
-      Tags:
-        - Key: Application
-          Value: PdfProtection
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: github-pdf-protection-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+          audience: sts.amazonaws.com
+          retry-max-attempts: 3
 
-        - Key: ManagedBy
-          Value: CloudFormation
+      - name: Verify assumed AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
 
-  PdfProtectionFunction:
-    Type: AWS::Serverless::Function
+          ACCOUNT_ID="$(
+            aws sts get-caller-identity \
+              --query Account \
+              --output text
+          )"
 
-    Metadata:
-      Dockerfile: Dockerfile
-      DockerContext: .
-      DockerTag: python3.13-qpdf-v1
+          CALLER_ARN="$(
+            aws sts get-caller-identity \
+              --query Arn \
+              --output text
+          )"
 
-    Properties:
-      PackageType: Image
+          if [ "$ACCOUNT_ID" != "975050060060" ]; then
+            echo "The workflow authenticated to the wrong AWS account."
+            echo "Expected account: 975050060060"
+            echo "Actual account: $ACCOUNT_ID"
+            exit 1
+          fi
 
-      Architectures:
-        - x86_64
+          echo "AWS account verified: $ACCOUNT_ID"
+          echo "Caller ARN: $CALLER_ARN"
 
-      MemorySize: !Ref FunctionMemorySize
-      Timeout: !Ref FunctionTimeout
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      EphemeralStorage:
-        Size: !Ref EphemeralStorageSize
+      - name: Display tool versions
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      Environment:
-        Variables:
-          OUTPUT_BUCKET: !Sub "pdf-protection-output-${AWS::AccountId}-${AWS::Region}"
-          OWNER_PASSWORD_SECRET_ARN: !Ref PdfOwnerPasswordSecret
-          LOG_LEVEL: INFO
+          aws --version
+          sam --version
+          docker --version
 
-      Policies:
-        - Version: "2012-10-17"
-          Statement:
-            - Sid: ReadInputBucketObjects
-              Effect: Allow
-              Action:
-                - s3:GetObject
-                - s3:GetObjectVersion
-              Resource:
-                - !Sub "arn:${AWS::Partition}:s3:::pdf-protection-input-${AWS::AccountId}-${AWS::Region}/*"
+      - name: Validate SAM template
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            - Sid: WriteOutputBucketObjects
-              Effect: Allow
-              Action:
-                - s3:PutObject
-              Resource:
-                - !Sub "arn:${AWS::Partition}:s3:::pdf-protection-output-${AWS::AccountId}-${AWS::Region}/*"
+          sam validate \
+            --template-file template.yaml \
+            --lint
 
-            - Sid: ReadPdfOwnerPassword
-              Effect: Allow
-              Action:
-                - secretsmanager:GetSecretValue
-              Resource:
-                - !Ref PdfOwnerPasswordSecret
+      - name: Build Lambda container
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      Events:
-        PdfUploaded:
-          Type: S3
-          Properties:
-            Bucket: !Ref InputBucket
-            Events:
-              - s3:ObjectCreated:*
+          sam build \
+            --template-file template.yaml
 
-  FunctionErrorAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmDescription: PDF protection Lambda function has reported an error
+      - name: Deploy SAM application
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      Namespace: AWS/Lambda
-      MetricName: Errors
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name "$AWS_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --resolve-s3 \
+            --resolve-image-repos \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              FunctionMemorySize=2048 \
+              FunctionTimeout=300 \
+              EphemeralStorageSize=4096
 
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref PdfProtectionFunction
+      - name: Display deployment outputs
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      DatapointsToAlarm: 1
-      Threshold: 1
-
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-
-  FunctionThrottleAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmDescription: PDF protection Lambda function has been throttled
-
-      Namespace: AWS/Lambda
-      MetricName: Throttles
-
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref PdfProtectionFunction
-
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      DatapointsToAlarm: 1
-      Threshold: 1
-
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-
-Outputs:
-  InputBucketName:
-    Description: Upload unprotected PDF documents to this bucket
-    Value: !Ref InputBucket
-
-  InputBucketArn:
-    Description: ARN of the input S3 bucket
-    Value: !GetAtt InputBucket.Arn
-
-  OutputBucketName:
-    Description: Protected PDF documents are written to this bucket
-    Value: !Ref OutputBucket
-
-  OutputBucketArn:
-    Description: ARN of the output S3 bucket
-    Value: !GetAtt OutputBucket.Arn
-
-  LambdaFunctionName:
-    Description: PDF processing Lambda function
-    Value: !Ref PdfProtectionFunction
-
-  LambdaFunctionArn:
-    Description: ARN of the PDF processing Lambda function
-    Value: !GetAtt PdfProtectionFunction.Arn
-
-  OwnerPasswordSecretArn:
-    Description: ARN of the generated PDF owner-password secret
-    Value: !Ref PdfOwnerPasswordSecret
-
-  ErrorAlarmName:
-    Description: CloudWatch alarm that detects Lambda function errors
-    Value: !Ref FunctionErrorAlarm
-
-  ThrottleAlarmName:
-    Description: CloudWatch alarm that detects Lambda throttling
-    Value: !Ref FunctionThrottleAlarm
+          aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs" \
+            --output table
