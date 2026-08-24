@@ -200,25 +200,25 @@ def process_record(record, owner_password):
         input_path = work_path / "input.pdf"
         output_path = work_path / "protected.pdf"
 
-        download_parameters = {
-            "Bucket": bucket,
-            "Key": key,
-        }
+        download_extra_args = {}
 
-        if version_id:
-            download_parameters["VersionId"] = version_id
+if version_id:
+    download_extra_args["VersionId"] = version_id
 
-        try:
-            s3.download_file(
-                bucket,
-                key,
-                str(input_path),
-                ExtraArgs=(
-                    {"VersionId": version_id}
-                    if version_id
-                    else None
-                ),
-            )
+try:
+    if download_extra_args:
+        s3.download_file(
+            bucket,
+            key,
+            str(input_path),
+            ExtraArgs=download_extra_args,
+        )
+    else:
+        s3.download_file(
+            bucket,
+            key,
+            str(input_path),
+        )
         except ClientError as exc:
             raise PdfProcessingError(
                 f"Unable to download s3://{bucket}/{key}"
