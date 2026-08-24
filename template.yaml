@@ -1,1 +1,181 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
 
+Description: >
+  Serverless PDF protection pipeline using S3, Lambda,
+  qpdf and AWS Secrets Manager.
+
+Parameters:
+  FunctionMemorySize:
+    Type: Number
+    Default: 2048
+    MinValue: 1024
+    MaxValue: 10240
+    Description: Memory allocated to the PDF processing function.
+
+  FunctionTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda timeout in seconds.
+
+  EphemeralStorageSize:
+    Type: Number
+    Default: 4096
+    MinValue: 512
+    MaxValue: 10240
+    Description: Temporary /tmp storage in MB.
+
+Resources:
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  PdfOwnerPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Owner password used to protect generated PDFs
+      GenerateSecretString:
+        SecretStringTemplate: '{"purpose":"pdf-owner-password"}'
+        GenerateStringKey: owner_password
+        PasswordLength: 40
+        ExcludePunctuation: true
+      Tags:
+        - Key: Application
+          Value: PdfProtection
+
+  PdfProtectionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: .
+      DockerTag: python3.13-qpdf-v1
+    Properties:
+      PackageType: Image
+      Architectures:
+        - x86_64
+      MemorySize: !Ref FunctionMemorySize
+      Timeout: !Ref FunctionTimeout
+      EphemeralStorage:
+        Size: !Ref EphemeralStorageSize
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          OWNER_PASSWORD_SECRET_ARN: !Ref PdfOwnerPasswordSecret
+          LOG_LEVEL: INFO
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadInputObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${InputBucket.Arn}/*"
+
+            - Sid: WriteOutputObjects
+              Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "${OutputBucket.Arn}/*"
+
+            - Sid: ReadOwnerPassword
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref PdfOwnerPasswordSecret
+
+      Events:
+        PdfUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref InputBucket
+            Events:
+              - s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: PDF protection Lambda has reported an error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PdfProtectionFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  InputBucketName:
+    Description: Upload unprotected PDFs to this bucket
+    Value: !Ref InputBucket
+
+  OutputBucketName:
+    Description: Protected PDFs are written to this bucket
+    Value: !Ref OutputBucket
+
+  LambdaFunctionName:
+    Description: PDF processing Lambda function
+    Value: !Ref PdfProtectionFunction
+
+  OwnerPasswordSecretArn:
+    Description: ARN of the generated owner password secret
+    Value: !Ref PdfOwnerPasswordSecret
+
+  ErrorAlarmName:
+    Description: CloudWatch alarm that detects function errors
+    Value: !Ref FunctionErrorAlarm
