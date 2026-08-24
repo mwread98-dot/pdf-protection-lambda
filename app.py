@@ -1,17 +1,24 @@
 import json
 import logging
 import os
+import pathlib
 import subprocess
 import tempfile
-from pathlib import Path
-from urllib.parse import unquote_plus
+import urllib.parse
+from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
 
 
-logger = logging.getLogger()
-logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+logger = logging.getLogger(__name__)
 
 s3 = boto3.client("s3")
 secrets_manager = boto3.client("secretsmanager")
@@ -19,269 +26,403 @@ secrets_manager = boto3.client("secretsmanager")
 OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
 OWNER_PASSWORD_SECRET_ARN = os.environ["OWNER_PASSWORD_SECRET_ARN"]
 
-# Cache the password for warm Lambda invocations.
-_cached_owner_password = None
-
 
 class PdfProcessingError(Exception):
-    """Raised when a PDF cannot be protected or verified."""
+    """Raised when a PDF cannot be processed successfully."""
 
 
-def get_owner_password():
-    global _cached_owner_password
+def get_owner_password() -> str:
+    """
+    Retrieve the PDF owner password from AWS Secrets Manager.
 
-    if _cached_owner_password is not None:
-        return _cached_owner_password
-
-    response = secrets_manager.get_secret_value(
-        SecretId=OWNER_PASSWORD_SECRET_ARN
-    )
+    Expected secret structure:
+    {
+        "purpose": "pdf-owner-password",
+        "owner_password": "generated-password"
+    }
+    """
+    try:
+        response = secrets_manager.get_secret_value(
+            SecretId=OWNER_PASSWORD_SECRET_ARN
+        )
+    except ClientError as exc:
+        raise PdfProcessingError(
+            "Unable to retrieve the PDF owner password from Secrets Manager."
+        ) from exc
 
     secret_string = response.get("SecretString")
+
     if not secret_string:
         raise PdfProcessingError(
-            "The Secrets Manager secret does not contain SecretString."
+            "The PDF owner-password secret does not contain SecretString."
         )
 
     try:
-        secret = json.loads(secret_string)
-        password = secret["owner_password"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        secret_value = json.loads(secret_string)
+    except json.JSONDecodeError as exc:
         raise PdfProcessingError(
-            "The secret must be JSON containing an owner_password field."
+            "The PDF owner-password secret is not valid JSON."
         ) from exc
 
-    if not isinstance(password, str) or not password:
+    owner_password = secret_value.get("owner_password")
+
+    if not isinstance(owner_password, str) or not owner_password:
         raise PdfProcessingError(
-            "The owner_password value must be a non-empty string."
+            "The PDF owner-password secret does not contain a valid "
+            "owner_password value."
         )
 
-    _cached_owner_password = password
-    return password
+    return owner_password
 
 
-def run_command(command, description):
+def run_command(
+    command: list[str],
+    *,
+    sensitive_values: list[str] | None = None,
+) -> subprocess.CompletedProcess"""
+    Run a subprocess and raise PdfProcessingError if it fails.
+
+    Any sensitive values are removed from the version of the command
+    written to logs.
     """
-    Run a command without logging its argument list.
+    sensitive_values = sensitive_values or []
 
-    This is important because the qpdf command contains the owner password.
-    """
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=840,
-        check=False,
-    )
+    safe_command = command.copy()
 
-    if result.returncode not in (0, 3):
-        # qpdf exit code 3 means the operation completed with warnings.
-        safe_error = result.stderr.strip()
+    for index, argument in enumerate(safe_command):
+        if argument in sensitive_values:
+            safe_command[index] = "***REDACTED***"
 
-        raise PdfProcessingError(
-            f"{description} failed with exit code "
-            f"{result.returncode}: {safe_error}"
+    logger.info("Running command: %s", safe_command)
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=240,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise PdfProcessingError(
+            "qpdf did not complete within 240 seconds."
+        ) from exc
+    except OSError as exc:
+        raise PdfProcessingError(
+            "Unable to start qpdf."
+        ) from exc
 
-    if result.returncode == 3:
-        logger.warning("%s completed with qpdf warnings.", description)
+    if result.stdout:
+        logger.info("Command stdout: %s", result.stdout.strip())
+
+    if result.stderr:
+        logger.info("Command stderr: %s", result.stderr.strip())
+
+    if result.returncode != 0:
+        raise PdfProcessingError(
+            f"qpdf returned exit code {result.returncode}."
+        )
 
     return result
 
 
-def protect_pdf(input_path, output_path, owner_password):
+def validate_input_pdf(input_path: pathlib.Path) -> None:
+    """Check that the downloaded input is a structurally valid PDF."""
+    run_command(
+        [
+            "qpdf",
+            "--check",
+            str(input_path),
+        ]
+    )
+
+
+def protect_pdf(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    owner_password: str,
+) -> None:
+    """
+    Encrypt a PDF with an empty user password and a secret owner password.
+
+    The empty user password permits ordinary opening of the document.
+    The owner password controls permissions and allows restrictions to
+    be bypassed by an authorised owner.
+    """
     command = [
         "qpdf",
         "--encrypt",
-        "",                  # Empty user password: no password needed to open
-        owner_password,      # Owner/permissions password
-        "256",               # AES-256
-        "--print=low",       # Low-resolution printing only
-        "--modify=none",     # Disable all document modification
-        "--extract=n",       # Disable general extraction/copying
-        "--accessibility=y", # Retain accessibility extraction
+        "",
+        owner_password,
+        "256",
+        "--print=none",
+        "--modify=none",
+        "--extract=n",
+        "--annotate=n",
+        "--form=n",
+        "--assemble=n",
         "--",
         str(input_path),
         str(output_path),
     ]
 
-    run_command(command, "PDF protection")
+    run_command(
+        command,
+        sensitive_values=[owner_password],
+    )
 
 
-def verify_pdf(output_path):
-    # Check that the produced PDF is structurally readable.
+def verify_output_pdf(
+    output_path: pathlib.Path,
+    owner_password: str,
+) -> None:
+    """Verify that the output is readable and encrypted."""
     run_command(
         [
             "qpdf",
-            "--password=",
+            "--password=" + owner_password,
             "--check",
             str(output_path),
         ],
-        "PDF structural verification",
+        sensitive_values=["--password=" + owner_password],
     )
 
-    encryption_result = run_command(
+    result = run_command(
         [
             "qpdf",
-            "--password=",
+            "--password=" + owner_password,
             "--show-encryption",
             str(output_path),
         ],
-        "PDF encryption verification",
+        sensitive_values=["--password=" + owner_password],
     )
 
-    output = encryption_result.stdout.lower()
+    encryption_details = result.stdout.lower()
 
-    required_results = [
-        "print low resolution: allowed",
-        "print high resolution: not allowed",
-        "extract for accessibility: allowed",
-        "extract for any purpose: not allowed",
-        "modify document assembly: not allowed",
-        "modify forms: not allowed",
-        "modify annotations: not allowed",
-        "modify other: not allowed",
-    ]
-
-    missing = [
-        result for result in required_results
-        if result not in output
-    ]
-
-    # AES-256 normally appears as AESv3 for streams, strings and files.
-    if "aesv3" not in output:
-        missing.append("AESv3 encryption")
-
-    if missing:
+    if "file is not encrypted" in encryption_details:
         raise PdfProcessingError(
-            "Output PDF failed permission verification. Missing: "
-            + ", ".join(missing)
+            "qpdf created an output file that is not encrypted."
         )
 
-
-def output_key_for(source_key):
-    """
-    Preserve the input key structure.
-
-    Example:
-      incoming/customer-a/report.pdf
-    becomes:
-      incoming/customer-a/report.pdf
-    in the separate output bucket.
-    """
-    return source_key
+    logger.info("Protected PDF encryption verification succeeded.")
 
 
-def process_record(record, owner_password):
-    bucket = record["s3"]["bucket"]["name"]
-    key = unquote_plus(record["s3"]["object"]["key"])
+def download_input_object(
+    bucket: str,
+    key: str,
+    version_id: str | None,
+    destination: pathlib.Path,
+) -> None:
+    """Download an input S3 object, including a specific version if supplied."""
+    try:
+        if version_id:
+            s3.download_file(
+                bucket,
+                key,
+                str(destination),
+                ExtraArgs={
+                    "VersionId": version_id,
+                },
+            )
+        else:
+            s3.download_file(
+                bucket,
+                key,
+                str(destination),
+            )
+    except ClientError as exc:
+        raise PdfProcessingError(
+            f"Unable to download s3://{bucket}/{key}"
+        ) from exc
 
-    if not key.lower().endswith(".pdf"):
-        logger.info("Skipping non-PDF object: s3://%s/%s", bucket, key)
+
+def upload_output_object(
+    key: str,
+    source: pathlib.Path,
+    input_bucket: str,
+    input_version_id: str | None,
+) -> None:
+    """Upload a protected PDF to the output bucket."""
+    metadata = {
+        "pdf-protection": "qpdf-256-bit",
+        "source-bucket": input_bucket,
+    }
+
+    if input_version_id:
+        metadata["source-version-id"] = input_version_id
+
+    try:
+        s3.upload_file(
+            str(source),
+            OUTPUT_BUCKET,
+            key,
+            ExtraArgs={
+                "ContentType": "application/pdf",
+                "ServerSideEncryption": "AES256",
+                "Metadata": metadata,
+            },
+        )
+    except ClientError as exc:
+        raise PdfProcessingError(
+            f"Unable to upload s3://{OUTPUT_BUCKET}/{key}"
+        ) from exc
+
+
+def process_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Process one S3 event record."""
+    event_name = record.get("eventName", "")
+
+    if not event_name.startswith("ObjectCreated:"):
+        logger.info("Skipping unsupported S3 event: %s", event_name)
+
         return {
             "status": "skipped",
-            "source": f"s3://{bucket}/{key}",
+            "reason": "unsupported-event",
+            "event_name": event_name,
         }
 
-    version_id = record["s3"]["object"].get("versionId")
-    output_key = output_key_for(key)
+    s3_data = record.get("s3", {})
+    bucket_data = s3_data.get("bucket", {})
+    object_data = s3_data.get("object", {})
+
+    input_bucket = bucket_data.get("name")
+    encoded_key = object_data.get("key")
+    version_id = object_data.get("versionId")
+
+    if not input_bucket or not encoded_key:
+        raise PdfProcessingError(
+            "The S3 event did not contain a bucket name and object key."
+        )
+
+    key = urllib.parse.unquote_plus(encoded_key)
+
+    if not key.lower().endswith(".pdf"):
+        logger.info(
+            "Skipping non-PDF object: s3://%s/%s",
+            input_bucket,
+            key,
+        )
+
+        return {
+            "status": "skipped",
+            "reason": "not-a-pdf",
+            "bucket": input_bucket,
+            "key": key,
+        }
+
+    if input_bucket == OUTPUT_BUCKET:
+        logger.warning(
+            "Skipping an object from the output bucket to prevent a loop: "
+            "s3://%s/%s",
+            input_bucket,
+            key,
+        )
+
+        return {
+            "status": "skipped",
+            "reason": "output-bucket-event",
+            "bucket": input_bucket,
+            "key": key,
+        }
 
     logger.info(
         "Processing s3://%s/%s to s3://%s/%s",
-        bucket,
+        input_bucket,
         key,
         OUTPUT_BUCKET,
-        output_key,
+        key,
     )
 
-    with tempfile.TemporaryDirectory(dir="/tmp") as work_dir:
-        work_path = Path(work_dir)
-        input_path = work_path / "input.pdf"
-        output_path = work_path / "protected.pdf"
+    with tempfile.TemporaryDirectory(prefix="pdf-protection-") as temp_dir:
+        temporary_directory = pathlib.Path(temp_dir)
 
-        download_extra_args = {}
+        input_path = temporary_directory / "input.pdf"
+        output_path = temporary_directory / "protected.pdf"
 
-if version_id:
-    download_extra_args["VersionId"] = version_id
-
-try:
-    if download_extra_args:
-        s3.download_file(
-            bucket,
+        download_input_object(
+            input_bucket,
             key,
-            str(input_path),
-            ExtraArgs=download_extra_args,
+            version_id,
+            input_path,
         )
-    else:
-        s3.download_file(
-            bucket,
-            key,
-            str(input_path),
-        )
-        except ClientError as exc:
+
+        if not input_path.exists() or input_path.stat().st_size == 0:
             raise PdfProcessingError(
-                f"Unable to download s3://{bucket}/{key}"
-            ) from exc
-
-        if input_path.stat().st_size == 0:
-            raise PdfProcessingError("The input object is empty.")
-
-        protect_pdf(input_path, output_path, owner_password)
-        verify_pdf(output_path)
-
-        source_version = version_id or "unversioned"
-
-        try:
-            s3.upload_file(
-                str(output_path),
-                OUTPUT_BUCKET,
-                output_key,
-                ExtraArgs={
-                    "ContentType": "application/pdf",
-                    "Metadata": {
-                        "source-bucket": bucket,
-                        "source-key": key,
-                        "source-version": source_version,
-                        "pdf-protection": "aes-256-restricted",
-                    },
-                    "ServerSideEncryption": "AES256",
-                },
+                "The downloaded input object is empty."
             )
-        except ClientError as exc:
+
+        validate_input_pdf(input_path)
+
+        owner_password = get_owner_password()
+
+        protect_pdf(
+            input_path,
+            output_path,
+            owner_password,
+        )
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
             raise PdfProcessingError(
-                f"Unable to upload s3://{OUTPUT_BUCKET}/{output_key}"
-            ) from exc
+                "qpdf did not create a non-empty output file."
+            )
+
+        verify_output_pdf(
+            output_path,
+            owner_password,
+        )
+
+        upload_output_object(
+            key,
+            output_path,
+            input_bucket,
+            version_id,
+        )
+
+        output_size = output_path.stat().st_size
+
+    logger.info(
+        "Successfully wrote protected PDF to s3://%s/%s",
+        OUTPUT_BUCKET,
+        key,
+    )
 
     return {
         "status": "processed",
-        "source": f"s3://{bucket}/{key}",
-        "destination": f"s3://{OUTPUT_BUCKET}/{output_key}",
+        "input_bucket": input_bucket,
+        "input_key": key,
+        "input_version_id": version_id,
+        "output_bucket": OUTPUT_BUCKET,
+        "output_key": key,
+        "output_size": output_size,
     }
 
 
-def lambda_handler(event, context):
-    records = event.get("Records", [])
+def lambda_handler(
+    event: dict[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    """AWS Lambda entry point."""
+    request_id = getattr(context, "aws_request_id", "unknown")
 
-    if not records:
-        logger.warning("Invocation contained no S3 records.")
-        return {
-            "statusCode": 200,
-            "processed": [],
-            "message": "No S3 records supplied.",
-        }
+    logger.info(
+        "Received invocation request ID %s with %s record(s).",
+        request_id,
+        len(event.get("Records", [])),
+    )
 
-    owner_password = get_owner_password()
-    results = []
+    records = event.get("Records")
+
+    if not isinstance(records, list) or not records:
+        raise PdfProcessingError(
+            "The event did not contain any S3 records."
+        )
+
+    results: list[dict[str, Any]] = []
 
     for record in records:
-        if record.get("eventSource") != "aws:s3":
-            logger.warning("Skipping an event that is not from S3.")
-            continue
-
-        results.append(process_record(record, owner_password))
+        results.append(process_record(record))
 
     return {
-        "statusCode": 200,
-        "processed": results,
-    }
+        "request_id": request_id,
+        "record_count": len(records),
+      
