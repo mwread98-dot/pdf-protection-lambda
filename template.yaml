@@ -123,8 +123,6 @@ Resources:
       EphemeralStorage:
         Size: !Ref EphemeralStorageSize
 
-      ReservedConcurrentExecutions: 5
-
       Environment:
         Variables:
           OUTPUT_BUCKET: !Sub "pdf-protection-output-${AWS::AccountId}-${AWS::Region}"
@@ -168,7 +166,6 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmDescription: PDF protection Lambda function has reported an error
-
       Namespace: AWS/Lambda
       MetricName: Errors
 
@@ -181,7 +178,6 @@ Resources:
       EvaluationPeriods: 1
       DatapointsToAlarm: 1
       Threshold: 1
-
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
@@ -189,7 +185,6 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmDescription: PDF protection Lambda function has been throttled
-
       Namespace: AWS/Lambda
       MetricName: Throttles
 
@@ -202,7 +197,6 @@ Resources:
       EvaluationPeriods: 1
       DatapointsToAlarm: 1
       Threshold: 1
-
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
