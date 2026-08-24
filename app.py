@@ -76,14 +76,15 @@ def get_owner_password() -> str:
 
 
 def run_command(
-    command: list[str],
+    command: li*t[str],
     *,
-    sensitive_values: list[str] | None = None,
-) -> subprocess.CompletedProcess"""
-    Run a subprocess and raise PdfProcessingError if it fails.
+    sensitive_value*: list[str] | None = None,
+) -> su*process.CompletedProcess:
+    """
+*   Run a subprocess and raise PdfP*ocessingError if it fails.
 
-    Any sensitive values are removed from the version of the command
-    written to logs.
+    An* sensitive values are removed from*the version of the command
+    wri*ten to logs.
     """
     sensitive_values = sensitive_values or []
 
