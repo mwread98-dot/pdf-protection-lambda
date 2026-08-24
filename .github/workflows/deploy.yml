@@ -1,1 +1,87 @@
+name: Build and deploy PDF protection service
 
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - "app.py"
+      - "Dockerfile"
+      - "requirements.txt"
+      - "template.yaml"
+      - ".github/workflows/deploy.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: pdf-protection-production
+  cancel-in-progress: false
+
+jobs:
+  validate-build-deploy:
+    name: Validate, build and deploy
+    runs-on: ubuntu-latest
+
+    environment: production
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_STACK_NAME: ${{ vars.AWS_STACK_NAME }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: github-pdf-protection-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Display AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Display tool versions
+        run: |
+          aws --version
+          sam --version
+          docker --version
+
+      - name: Validate SAM template
+        run: sam validate --lint
+
+      - name: Build Lambda container
+        run: sam build
+
+      - name: Deploy SAM application
+        run: |
+          sam deploy \
+            --stack-name "$AWS_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --resolve-image-repos \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              FunctionMemorySize=2048 \
+              FunctionTimeout=300 \
+              EphemeralStorageSize=4096
+
+      - name: Display deployment outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs" \
+            --output table
