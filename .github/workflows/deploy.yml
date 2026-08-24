@@ -73,6 +73,21 @@ jobs:
           echo "AWS Region: $AWS_REGION"
           echo "CloudFormation stack: $AWS_STACK_NAME"
 
+      - name: Verify template does not reserve Lambda concurrency
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -n "ReservedConcurrentExecutions" template.yaml; then
+            echo
+            echo "ERROR: template.yaml contains ReservedConcurrentExecutions."
+            echo "This AWS account cannot support the requested reservation."
+            echo "Remove the ReservedConcurrentExecutions property."
+            exit 1
+          fi
+
+          echo "Confirmed: no reserved concurrency is configured."
+
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -89,84 +104,4 @@ jobs:
 
           ACCOUNT_ID="$(
             aws sts get-caller-identity \
-              --query Account \
-              --output text
-          )"
-
-          CALLER_ARN="$(
-            aws sts get-caller-identity \
-              --query Arn \
-              --output text
-          )"
-
-          if [ "$ACCOUNT_ID" != "975050060060" ]; then
-            echo "The workflow authenticated to the wrong AWS account."
-            echo "Expected account: 975050060060"
-            echo "Actual account: $ACCOUNT_ID"
-            exit 1
-          fi
-
-          echo "AWS account verified: $ACCOUNT_ID"
-          echo "Caller ARN: $CALLER_ARN"
-
-      - name: Install AWS SAM CLI
-        uses: aws-actions/setup-sam@v3
-        with:
-          use-installer: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Display tool versions
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws --version
-          sam --version
-          docker --version
-
-      - name: Validate SAM template
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sam validate \
-            --template-file template.yaml \
-            --lint
-
-      - name: Build Lambda container
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sam build \
-            --template-file template.yaml
-
-      - name: Deploy SAM application
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sam deploy \
-            --template-file .aws-sam/build/template.yaml \
-            --stack-name "$AWS_STACK_NAME" \
-            --region "$AWS_REGION" \
-            --resolve-s3 \
-            --resolve-image-repos \
-            --capabilities CAPABILITY_IAM \
-            --no-confirm-changeset \
-            --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              FunctionMemorySize=2048 \
-              FunctionTimeout=300 \
-              EphemeralStorageSize=4096
-
-      - name: Display deployment outputs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          aws cloudformation describe-stacks \
-            --stack-name "$AWS_STACK_NAME" \
-            --region "$AWS_REGION" \
-            --query "Stacks[0].Outputs" \
-            --output table
+        
